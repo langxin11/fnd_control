@@ -153,6 +153,7 @@
                     <inertial mass="0.3" pos="0 0 0.02" diaginertia="0.001 0.001 0.001"/>
                     <joint name="joint7" pos="0 0 0" axis="0 0 1"/>
                     <geom class="visual" mesh="link_7"/>
+                    <site pos="0 0 0" name="link7_site"/>
                     <site pos="0 0 0.045" name="attachment_site"/>
 
                     <body name="dock1" pos="0 0 0.06" quat="1 0 0 0">
