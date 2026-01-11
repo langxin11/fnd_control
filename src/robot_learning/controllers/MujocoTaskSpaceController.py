@@ -354,86 +354,54 @@ class MujocoTaskSpaceController:
         desired_ee_vel: np.ndarray,
         desired_ee_acc: np.ndarray,
     ) -> np.ndarray:
-        """计算仅平动的任务空间控制。
+        """计算含姿态的任务空间控制。"""
+        pos_cur, vel_pos_cur, ori_err, vel_rot_cur = self.get_task_space_state_with_orientation(q, dq)
 
-        Args:
-            q: 关节位置。
-            dq: 关节速度。
-            desired_ee_pos: 期望末端位置。
-            desired_ee_vel: 期望末端速度。
-            desired_ee_acc: 期望末端加速度。
-
-        Returns:
-            关节力矩。
-        """
-        # 1. 获取当前任务空间状态（仅位置和速度）
-        pos_cur, vel_cur = self.get_task_space_state(q, dq)
-
-        # 2. 计算位置和速度误差
         pos_err = desired_ee_pos - pos_cur
-        vel_err = desired_ee_vel - vel_cur
+        vel_err = desired_ee_vel - vel_pos_cur
 
-        # 3. 获取平动雅可比矩阵
+        k_p_pos = 100.0
+        k_d_pos = 20.0
+        k_p_rot = 50.0
+        k_d_rot = 10.0
+
+        u_pos = desired_ee_acc + k_d_pos * vel_err + k_p_pos * pos_err
+        vel_rot_err = -vel_rot_cur
+        u_rot = k_p_rot * ori_err + k_d_rot * vel_rot_err
+        u_task = np.concatenate([u_pos, u_rot])
+
         J = self._get_jacobian(update_prev=True)
-        J_pos = J[:3, :]  # 只取前3行（平动部分）
 
-        # 4. 获取动力学参数
         M = np.zeros((self.nv, self.nv))
         mujoco.mj_fullM(self.model, M, self.data.qM)
         M_inv = np.linalg.inv(M + 1e-6 * np.eye(self.nv))
 
-        # 科氏力 + 重力
         h = self.data.qfrc_bias.copy()
 
-        # 5. PD控制 + 前馈加速度
-        # u = acc_des + Kd * vel_err + Kp * pos_err
-        k_p = 100.0  # 位置增益
-        k_d = 20.0  # 速度增益
+        Lambda_inv = J @ M_inv @ J.T
+        Lambda = np.linalg.inv(Lambda_inv + 1e-6 * np.eye(6))
 
-        u = desired_ee_acc + k_d * vel_err + k_p * pos_err
+        J_bar = M_inv @ J.T @ Lambda
+        N = np.eye(self.nv) - J_bar @ J
 
-        # 6. 动力学一致映射
-        # Lambda = (J * M^-1 * J^T)^-1
-        Lambda_inv = J_pos @ M_inv @ J_pos.T
-        Lambda = np.linalg.inv(Lambda_inv + 1e-6 * np.eye(3))
-
-        # 映射矩阵：lambda_map = M @ M_inv.T @ J^T @ pinv(J @ M_inv @ M @ M_inv.T @ J^T)
-        # 简化为动力学一致形式
-        lambda_map = M @ M_inv.T @ J_pos.T @ Lambda
-
-        # 7. 零空间控制
-        # 零空间投影：N = I - lambda_map @ J_pos @ M_inv
-        N = np.eye(self.nv) - lambda_map @ J_pos @ M_inv
-
-        # 零空间任务1：操控度优化
         grad_m = self.manipulability_gradient(q)
         k_manip = 0.2
         ddq_desired = k_manip * grad_m
         tau_null_manip = M @ ddq_desired
 
-        # 零空间任务2：阻尼（抑制振荡）
         D_null = 1.2 * np.eye(self.nv)
         tau_null_damp = -D_null @ dq
 
-        # 合并零空间力矩
         tau_null = N @ (tau_null_manip + tau_null_damp)
 
-        # 8. 合成总力矩
-        # tau = lambda_map @ (u - J_dot @ dq + J @ M_inv @ h) + tau_null
-
         if not hasattr(self, "J_dot"):
-            J_dot_dq = np.zeros(3)
+            J_dot_dq = np.zeros(6)
         else:
-            J_dot_pos = self.J_dot[:3, :]  # 只取平动部分的雅可比导数
-            J_dot_dq = J_dot_pos @ dq
+            J_dot_dq = self.J_dot @ dq
 
-        # 主任务力矩
-        tau_main = lambda_map @ (u - J_dot_dq + J_pos @ M_inv @ h)
-
-        # 总力矩
+        tau_main = J.T @ Lambda @ (u_task - J_dot_dq + J @ M_inv @ h)
         tau = tau_main + tau_null
 
-        # 9. 应用关节限位
         tau = self._apply_limits(tau, q, dq)
 
         return tau
